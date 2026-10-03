@@ -601,47 +601,57 @@ func TestParallelSchema(t *testing.T) {
 
 func TestPostgres_ConcurrentMigrations(t *testing.T) {
 	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
-		// GIVEN - a set of concurrent processes running migrations
-		const concurrency = 3
-		var wg sync.WaitGroup
-
 		ip, port, err := c.FirstPort()
 		if err != nil {
 			t.Fatal(err)
 		}
 		addr := pgConnectionString(ip, port, "x-lock-retry-max-interval=2000")
 
+		// GIVEN - a set of concurrent processes running migrations
+		const concurrency = 3
+		errs := make(chan error, concurrency)
+
 		// WHEN
-		for i := 0; i < concurrency; i++ {
-			wg.Add(1)
-
-			go func() {
-				defer wg.Done()
-
-				p := &Postgres{}
-				d, err := p.Open(addr)
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				defer func() {
-					if err := d.Close(); err != nil {
-						t.Error(err)
-					}
-				}()
-
-				m, err := migrate.NewWithDatabaseInstance("file://../examples/migrations", "pgx", d)
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				dt.TestMigrate(t, m)
-			}()
+		var wg sync.WaitGroup
+		for range concurrency {
+			wg.Go(func() {
+				errs <- migrateUp(addr)
+			})
 		}
-
 		wg.Wait()
-		// THEN
+		close(errs)
+
+		// THEN - only one of them applies the migrations
+		applied := 0
+		for err := range errs {
+			switch {
+			case err == nil:
+				applied++
+			case !errors.Is(err, migrate.ErrNoChange):
+				t.Error(err)
+			}
+		}
+		if applied != 1 {
+			t.Errorf("migrations applied %d times, want 1", applied)
+		}
 	})
+}
+
+func migrateUp(addr string) (err error) {
+	p := &Postgres{}
+	d, err := p.Open(addr)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, d.Close())
+	}()
+
+	m, err := migrate.NewWithDatabaseInstance("file://../examples/migrations", "pgx", d)
+	if err != nil {
+		return err
+	}
+	return m.Up()
 }
 
 func TestPostgres_Lock(t *testing.T) {
