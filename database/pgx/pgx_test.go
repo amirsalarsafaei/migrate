@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dhui/dktest"
 	"github.com/golang-migrate/migrate/v4"
@@ -826,6 +827,55 @@ func Test_computeLineFromPos(t *testing.T) {
 			run(true, false)
 			run(false, true)
 			run(true, true)
+		})
+	}
+}
+
+func TestLockConfig_applyDefaults(t *testing.T) {
+	defaults := LockConfig{
+		InitialRetryInterval: DefaultLockInitialRetryInterval,
+		MaxRetryInterval:     DefaultLockMaxRetryInterval,
+	}
+
+	tests := []struct {
+		name   string
+		config LockConfig
+		want   LockConfig
+	}{
+		{
+			name:   "unset",
+			config: LockConfig{},
+			want:   defaults,
+		},
+		{
+			name:   "negative",
+			config: LockConfig{InitialRetryInterval: -1, MaxRetryInterval: -1},
+			want:   defaults,
+		},
+		{
+			name:   "custom max",
+			config: LockConfig{MaxRetryInterval: 5 * time.Second},
+			want:   LockConfig{InitialRetryInterval: DefaultLockInitialRetryInterval, MaxRetryInterval: 5 * time.Second},
+		},
+		{
+			name:   "max below initial",
+			config: LockConfig{MaxRetryInterval: 50 * time.Millisecond},
+			want:   LockConfig{InitialRetryInterval: DefaultLockInitialRetryInterval, MaxRetryInterval: DefaultLockInitialRetryInterval},
+		},
+		{
+			name:   "initial above default max",
+			config: LockConfig{InitialRetryInterval: 2 * time.Second},
+			want:   LockConfig{InitialRetryInterval: 2 * time.Second, MaxRetryInterval: 2 * time.Second},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config
+			got.applyDefaults()
+			if got != tt.want {
+				t.Errorf("applyDefaults() = %+v, want %+v", got, tt.want)
+			}
 		})
 	}
 }

@@ -136,13 +136,7 @@ func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*Postg
 		}
 	}
 
-	if config.Locking.InitialRetryInterval <= 0 {
-		config.Locking.InitialRetryInterval = DefaultLockInitialRetryInterval
-	}
-
-	if config.Locking.MaxRetryInterval <= 0 {
-		config.Locking.MaxRetryInterval = DefaultLockMaxRetryInterval
-	}
+	config.Locking.applyDefaults()
 
 	px := &Postgres{
 		conn:   conn,
@@ -228,19 +222,13 @@ func (p *Postgres) Open(url string) (database.Driver, error) {
 		}
 	}
 
-	lockConfig := LockConfig{
-		InitialRetryInterval: DefaultLockInitialRetryInterval,
-		MaxRetryInterval:     DefaultLockMaxRetryInterval,
-	}
+	var lockConfig LockConfig
 	if s := purl.Query().Get("x-lock-retry-max-interval"); len(s) > 0 {
 		maxRetryIntervalMillis, err := strconv.Atoi(s)
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse option x-lock-retry-max-interval: %w", err)
 		}
-		maxRetryInterval := time.Duration(maxRetryIntervalMillis) * time.Millisecond
-		if maxRetryInterval > DefaultLockInitialRetryInterval {
-			lockConfig.MaxRetryInterval = maxRetryInterval
-		}
+		lockConfig.MaxRetryInterval = time.Duration(maxRetryIntervalMillis) * time.Millisecond
 	}
 
 	px, err := WithInstance(db, &Config{
@@ -553,6 +541,19 @@ func (p *Postgres) ensureVersionTable() (err error) {
 	}
 
 	return nil
+}
+
+func (l *LockConfig) applyDefaults() {
+	if l.InitialRetryInterval <= 0 {
+		l.InitialRetryInterval = DefaultLockInitialRetryInterval
+	}
+
+	if l.MaxRetryInterval <= 0 {
+		l.MaxRetryInterval = DefaultLockMaxRetryInterval
+	}
+
+	// a max below the initial interval would already be exceeded by the first retry
+	l.MaxRetryInterval = max(l.MaxRetryInterval, l.InitialRetryInterval)
 }
 
 func (l *LockConfig) nonStopBackoff() backoff.BackOff {
