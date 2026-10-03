@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 
@@ -100,6 +101,7 @@ func Test(t *testing.T) {
 	t.Run("testPostgresLock", testPostgresLock)
 	t.Run("testWithInstanceConcurrent", testWithInstanceConcurrent)
 	t.Run("testWithConnection", testWithConnection)
+	t.Run("testWithConnectionLockContext", testWithConnectionLockContext)
 
 	t.Cleanup(func() {
 		for _, spec := range specs {
@@ -789,6 +791,76 @@ func testWithConnection(t *testing.T) {
 			}
 		}()
 		dt.Test(t, p, []byte("SELECT 1"))
+	})
+}
+
+func testWithConnectionLockContext(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		ip, port, err := c.FirstPort()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		db, err := sql.Open("postgres", pgConnectionString(ip, port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		// GIVEN - lock held by another connection
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		waiterConn, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		waiter, err := WithConnection(ctx, waiterConn, &Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := waiter.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+
+		if got := waiter.config.Locking; got.InitialRetryInterval != DefaultLockInitialRetryInterval || got.MaxRetryInterval != DefaultLockMaxRetryInterval {
+			t.Errorf("expected default lock retry intervals, got %+v", got)
+		}
+
+		holderConn, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		holder, err := WithConnection(context.Background(), holderConn, &Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := holder.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if err := holder.Lock(); err != nil {
+			t.Fatal(err)
+		}
+
+		time.AfterFunc(500*time.Millisecond, cancel)
+
+		// WHEN
+		err = waiter.Lock()
+
+		// THEN
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected %v, got %v", context.Canceled, err)
+		}
+		if err := holder.Unlock(); err != nil {
+			t.Fatal(err)
+		}
 	})
 }
 

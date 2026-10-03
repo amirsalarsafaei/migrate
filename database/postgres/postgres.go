@@ -74,10 +74,14 @@ type Postgres struct {
 	db       *sql.DB
 	isLocked atomic.Bool
 
+	// used to stop retrying in Lock
+	ctx context.Context
+
 	// Open and WithInstance need to guarantee that config is never nil
 	config *Config
 }
 
+// WithConnection keeps ctx around: Lock stops retrying once it's done.
 func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*Postgres, error) {
 	if config == nil {
 		return nil, ErrNilConfig
@@ -132,8 +136,17 @@ func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*Postg
 		}
 	}
 
+	if config.Locking.InitialRetryInterval <= 0 {
+		config.Locking.InitialRetryInterval = DefaultLockInitialRetryInterval
+	}
+
+	if config.Locking.MaxRetryInterval <= 0 {
+		config.Locking.MaxRetryInterval = DefaultLockMaxRetryInterval
+	}
+
 	px := &Postgres{
 		conn:   conn,
+		ctx:    ctx,
 		config: config,
 	}
 
@@ -260,15 +273,20 @@ func (p *Postgres) Close() error {
 	return nil
 }
 
-// Lock tries to acquire an advisory lock and retries indefinitely with an exponential backoff strategy
+// Lock tries to acquire an advisory lock and retries indefinitely with an exponential backoff strategy,
+// unless the context passed to WithConnection is done
 // https://www.postgresql.org/docs/9.6/static/explicit-locking.html#ADVISORY-LOCKS
 func (p *Postgres) Lock() error {
 	return database.CasRestoreOnErr(&p.isLocked, false, true, database.ErrLocked, func() error {
-		backOff := p.config.Locking.nonStopBackoff()
-		err := backoff.Retry(func() error {
+		backOff := backoff.WithContext(p.config.Locking.nonStopBackoff(), p.ctx)
+		return backoff.Retry(func() error {
+			if err := p.ctx.Err(); err != nil {
+				return backoff.Permanent(err)
+			}
+
 			ok, err := p.tryLock()
 			if err != nil {
-				return fmt.Errorf("p.tryLock: %w", err)
+				return backoff.Permanent(err)
 			}
 
 			if ok {
@@ -277,8 +295,6 @@ func (p *Postgres) Lock() error {
 
 			return fmt.Errorf("could not acquire lock") // causes retry
 		}, backOff)
-
-		return err
 	})
 }
 
@@ -290,6 +306,7 @@ func (p *Postgres) tryLock() (bool, error) {
 
 	// https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS
 	// should always return true or false
+	// not using p.ctx on purpose, canceling after the lock was granted would leave it held
 	query := `SELECT pg_try_advisory_lock($1)`
 	var ok bool
 	if err := p.conn.QueryRowContext(context.Background(), query, aid).Scan(&ok); err != nil {
